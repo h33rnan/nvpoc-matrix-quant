@@ -4,8 +4,6 @@
 
 ![Dark Mode](Artic_Mode.png)
 
-![Light Mode](Mono_Mode.png)
-
 **[🇪🇸 Español]**
 El volumen no desaparece, deja huellas magnéticas. El "Naked Volume Point of Control" (NVPOC) es el nivel de precio donde se ejecutó el mayor volumen de una sesión y que aún no ha sido re-testeado. Este algoritmo no es un simple dibujador de perfiles; es un motor cuantitativo orientado a objetos que escanea la micro-estructura, aísla el Horario Regular (RTH) y gestiona la liquidez viva.
 
