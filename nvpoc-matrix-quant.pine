@@ -1,0 +1,375 @@
+//@version=6
+indicator('NVPOC Matrix', max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500, overlay = true)
+
+// =============================================================================
+// 1. ESTÉTICA QUIRÚRGICA & UI PRO (STRICT ARTIC/MONO BASE)
+// =============================================================================
+string G_THEME = "Estética Quirúrgica & UI"
+string themeChoice = input.string("Artic", "Tema Visual", options = ["Artic", "Mono"], group=G_THEME)
+bool isLight = input.bool(false, "☀️", group=G_THEME)
+string hudPosInput = input.string("Bottom Right", "Posición del HUD", options=["Top Right", "Top Center", "Top Left", "Bottom Right", "Bottom Left", "None"], group=G_THEME)
+string hudSizeInput = input.string("Small", "Tamaño del Panel", options=["Tiny", "Small", "Normal", "Large"], group=G_THEME)
+
+string hudSize = hudSizeInput == "Tiny" ? size.tiny : hudSizeInput == "Small" ? size.small : hudSizeInput == "Normal" ? size.normal : size.large
+var string tbl_pos = hudPosInput == "Top Right" ? position.top_right : hudPosInput == "Top Center" ? position.top_center : hudPosInput == "Bottom Right" ? position.bottom_right : hudPosInput == "Top Left" ? position.top_left : hudPosInput == "Bottom Left" ? position.bottom_left : na
+
+color thBull = themeChoice == "Mono" ? (isLight ? #616161 : #9e9e9e) : (isLight ? #0288d1 : #4fc3f7) 
+color thBear = themeChoice == "Mono" ? (isLight ? #212121 : #424242) : (isLight ? #512da8 : #b39ddb) 
+color thSweep = themeChoice == "Mono" ? (isLight ? #000000 : #ffffff) : (isLight ? #0097a7 : #00e5ff) 
+
+color bgHud = isLight ? color.new(color.white, 20) : color.new(color.black, 90)
+color borderHud = isLight ? color.new(color.gray, 60) : color.new(color.gray, 85)
+color txtMain = isLight ? color.black : color.white
+color txtSub = isLight ? color.new(color.black, 30) : color.rgb(255, 255, 255)
+
+color c_t1 = color.new(thBull, 40)   
+color c_t2 = color.new(thSweep, 10)  
+color c_t3 = color.new(thBear, 0)    
+color c_mitigated = color.new(txtSub, 60) 
+
+// =============================================================================
+// 2. CONFIGURACIÓN DEL MOTOR NVPOC
+// =============================================================================
+string G_SYS = "Motor Cuantitativo NVPOC"
+inp_hide_hit = input.bool(false, title = 'Aniquilar Líneas Mitigadas (Limpieza Visual)?', group=G_SYS)
+inp_show_tags = input.bool(true, title = 'Mostrar Price Trackers (Margen Derecho)?', group=G_SYS)
+inp_num_bins = input.int(250, title = 'Resolución del Perfil (Bins)', group=G_SYS)
+inp_source_tf = input.timeframe('5', title = 'Timeframe Base (Micro-estructura)', group=G_SYS)
+inp_vol_threshold = input.float(10.0, title = 'Filtro de Volumen Minimo (%)', group = G_SYS)
+
+string G_RTH = 'Horario Operativo (RTH NY)'
+inp_rth_start_hour = input.int(9, title = 'RTH Inicio Hora', minval = 0, maxval = 23, group = G_RTH)
+inp_rth_start_min = input.int(30, title = 'RTH Inicio Minuto', minval = 0, maxval = 59, group = G_RTH)
+inp_rth_end_hour = input.int(16, title = 'RTH Fin Hora', minval = 0, maxval = 23, group = G_RTH)
+inp_rth_end_min = input.int(0, title = 'RTH Fin Minuto', minval = 0, maxval = 59, group = G_RTH)
+
+// =============================================================================
+// 3. FUNCIONES DE TIEMPO
+// =============================================================================
+get_session_date(t) =>
+    year(t, 'America/New_York') * 10000 + month(t, 'America/New_York') * 100 + dayofmonth(t, 'America/New_York')
+
+is_within_rth(t) =>
+    h = hour(t, 'America/New_York')
+    m = minute(t, 'America/New_York')
+    time_mins = h * 60 + m
+    start_mins = inp_rth_start_hour * 60 + inp_rth_start_min
+    end_mins = inp_rth_end_hour * 60 + inp_rth_end_min
+    time_mins >= start_mins and time_mins < end_mins
+
+method format_vol(float v) =>
+    v >= 1000000 ? str.tostring(v / 1000000, "#.##") + "M" : v >= 1000 ? str.tostring(v / 1000, "#.#") + "K" : str.tostring(v, "#")
+
+// =============================================================================
+// 4. DATA ARCHITECTURE (OOP)
+// =============================================================================
+type NVPOC
+    line lvl_line
+    label price_lbl
+    float price
+    float volume
+    int tier
+    int date
+    bool hit
+
+var array<NVPOC> npocs = array.new<NVPOC>()
+var array<float> recent_vols = array.new_float()
+var float avg_vol = na
+
+var int current_date = na
+var float s_high = na
+var float s_low = na
+var float s_vol = 0.0
+var int s_start_bar = na
+var array<float> s_highs = array.new_float()
+var array<float> s_lows = array.new_float()
+var array<float> s_vols = array.new_float()
+
+[ltf_time, ltf_high, ltf_low, ltf_volume] = request.security_lower_tf(syminfo.tickerid, inp_source_tf, [time, high, low, volume])
+
+// =============================================================================
+// 5. MOTOR DE PROCESAMIENTO NVPOC
+// =============================================================================
+if array.size(ltf_time) > 0
+    for i = 0 to array.size(ltf_time) - 1 by 1
+        t = array.get(ltf_time, i)
+        h = array.get(ltf_high, i)
+        l = array.get(ltf_low, i)
+        v = array.get(ltf_volume, i)
+
+        bar_date = get_session_date(t)
+        bar_is_rth = is_within_rth(t)
+
+        // --- A. MOTOR DE MITIGACIÓN ---
+        if bar_is_rth and array.size(npocs) > 0
+            for j = array.size(npocs) - 1 to 0 by 1
+                NVPOC p = array.get(npocs, j)
+                if not p.hit
+                    if l <= p.price and h >= p.price
+                        p.hit := true
+                        array.set(npocs, j, p) 
+                        
+                        if inp_hide_hit
+                            line.delete(p.lvl_line)
+                            label.delete(p.price_lbl)
+                        else
+                            line.set_color(p.lvl_line, c_mitigated)
+                            line.set_style(p.lvl_line, line.style_dotted)
+                            line.set_extend(p.lvl_line, extend.none)
+                            line.set_x2(p.lvl_line, bar_index)
+                            label.delete(p.price_lbl) 
+
+        // --- B. ACUMULACIÓN DE SESIÓN ---
+        if bar_is_rth
+            if na(current_date) or bar_date != current_date
+                if not na(current_date) and not na(s_high) and s_high > s_low and array.size(s_highs) > 0
+                    
+                    array.unshift(recent_vols, s_vol)
+                    if array.size(recent_vols) > 20
+                        array.pop(recent_vols)
+
+                    if array.size(recent_vols) >= 5
+                        avg_vol := array.sum(recent_vols) / array.size(recent_vols)
+
+                    bool has_vol = true
+                    if not na(avg_vol) and avg_vol > 0
+                        has_vol := (s_vol / avg_vol * 100) >= inp_vol_threshold
+
+                    bool exists = false
+                    if array.size(npocs) > 0
+                        for j = 0 to array.size(npocs) - 1 by 1
+                            if array.get(npocs, j).date == current_date
+                                exists := true
+                                break
+
+                    // --- C. BINNING & POC EXTRACTION ---
+                    if not exists and has_vol
+                        array<float> tpo_bins = array.new_float(inp_num_bins, 0.0)
+                        inc = (s_high - s_low) / inp_num_bins
+
+                        for j = 0 to array.size(s_highs) - 1 by 1
+                            bh = array.get(s_highs, j)
+                            bl = array.get(s_lows, j)
+                            bv = array.get(s_vols, j)
+
+                            if bh > bl
+                                for b_idx = 0 to inp_num_bins - 1 by 1
+                                    b_bot = s_low + b_idx * inc
+                                    b_top = b_bot + inc
+                                    v_add = 0.0
+                                    
+                                    if bh <= b_top and bl >= b_bot
+                                        v_add := bv
+                                    else if bh > b_top and bl < b_bot
+                                        v_add := (b_top - b_bot) / (bh - bl) * bv
+                                    else if bh > b_bot and bh < b_top and bl < b_bot
+                                        v_add := (bh - b_bot) / (bh - bl) * bv
+                                    else if bl < b_top and bl > b_bot and bh > b_top
+                                        v_add := (b_top - bl) / (bh - bl) * bv
+
+                                    if v_add > 0
+                                        array.set(tpo_bins, b_idx, array.get(tpo_bins, b_idx) + v_add)
+
+                        poc_val = array.max(tpo_bins)
+                        poc_idx = array.indexof(tpo_bins, poc_val)
+                        vpoc = s_low + inc * (poc_idx + 0.5)
+
+                        int tier = 1
+                        if not na(avg_vol)
+                            if s_vol >= (avg_vol * 1.5)
+                                tier := 3
+                            else if s_vol >= (avg_vol * 1.0)
+                                tier := 2
+
+                        color l_col = tier == 3 ? c_t3 : tier == 2 ? c_t2 : c_t1
+                        int l_wid = tier == 3 ? 2 : 1
+                        string l_sty = tier == 3 ? line.style_solid : line.style_dashed
+
+                        line new_line = line.new(s_start_bar, vpoc, bar_index, vpoc, color=l_col, style=l_sty, width=l_wid, extend=extend.right)
+                        
+                        label new_lbl = na
+                        if inp_show_tags
+                            new_lbl := label.new(bar_index + 4, vpoc, text=str.tostring(vpoc, format.mintick), color=color.new(l_col, 20), textcolor=txtMain, style=label.style_label_left, size=size.small)
+
+                        array.unshift(npocs, NVPOC.new(new_line, new_lbl, vpoc, s_vol, tier, current_date, false))
+
+                current_date := bar_date
+                s_high := h
+                s_low := l
+                s_vol := v
+                s_start_bar := bar_index
+                array.clear(s_highs)
+                array.clear(s_lows)
+                array.clear(s_vols)
+                array.push(s_highs, h)
+                array.push(s_lows, l)
+                array.push(s_vols, v)
+
+            else 
+                s_high := math.max(s_high, h)
+                s_low := math.min(s_low, l)
+                s_vol += v
+                array.push(s_highs, h)
+                array.push(s_lows, l)
+                array.push(s_vols, v)
+
+if array.size(npocs) > 0
+    for j = 0 to array.size(npocs) - 1 by 1
+        NVPOC p = array.get(npocs, j)
+        if not p.hit and inp_show_tags
+            label.set_x(p.price_lbl, bar_index + 4)
+
+if array.size(npocs) > 500
+    NVPOC old = array.pop(npocs)
+    if not na(old.lvl_line)
+        line.delete(old.lvl_line)
+    if not na(old.price_lbl)
+        label.delete(old.price_lbl)
+
+// =============================================================================
+// 6. CURRENT SESSION VPOC (LIVE TRACKING)
+// =============================================================================
+var line live_poc_line = na
+var label live_poc_lbl = na
+var float live_vpoc = na
+
+if not na(s_high) and s_high > s_low and array.size(s_highs) > 0
+    array<float> tpo_bins = array.new_float(inp_num_bins, 0.0)
+    inc = (s_high - s_low) / inp_num_bins
+
+    for j = 0 to array.size(s_highs) - 1 by 1
+        bh = array.get(s_highs, j)
+        bl = array.get(s_lows, j)
+        bv = array.get(s_vols, j)
+
+        if bh > bl
+            for b_idx = 0 to inp_num_bins - 1 by 1
+                b_bot = s_low + b_idx * inc
+                b_top = b_bot + inc
+                v_add = 0.0
+                
+                if bh <= b_top and bl >= b_bot
+                    v_add := bv
+                else if bh > b_top and bl < b_bot
+                    v_add := (b_top - b_bot) / (bh - bl) * bv
+                else if bh > b_bot and bh < b_top and bl < b_bot
+                    v_add := (bh - b_bot) / (bh - bl) * bv
+                else if bl < b_top and bl > b_bot and bh > b_top
+                    v_add := (b_top - bl) / (bh - bl) * bv
+
+                if v_add > 0
+                    array.set(tpo_bins, b_idx, array.get(tpo_bins, b_idx) + v_add)
+
+    poc_val = array.max(tpo_bins)
+    poc_idx = array.indexof(tpo_bins, poc_val)
+    live_vpoc := s_low + inc * (poc_idx + 0.5)
+
+    if na(live_poc_line)
+        live_poc_line := line.new(s_start_bar, live_vpoc, bar_index, live_vpoc, color=color.new(#ffcc00, 30), style=line.style_dotted, width=2)
+        if inp_show_tags
+            live_poc_lbl := label.new(bar_index + 4, live_vpoc, text=str.tostring(live_vpoc, format.mintick), color=color.new(#ffcc00, 30), textcolor=txtMain, style=label.style_label_left, size=size.small)
+    else
+        line.set_xy1(live_poc_line, s_start_bar, live_vpoc)
+        line.set_xy2(live_poc_line, bar_index, live_vpoc)
+        if inp_show_tags
+            label.set_xy(live_poc_lbl, bar_index + 4, live_vpoc)
+            label.set_text(live_poc_lbl, str.tostring(live_vpoc, format.mintick))
+
+// =============================================================================
+// 7. GPS COMBAT HUD
+// =============================================================================
+method sort_up(array<NVPOC> arr) =>
+    int sz = array.size(arr)
+    if sz > 1
+        for i = 0 to sz - 2
+            for j = 0 to sz - 2 - i
+                NVPOC p1 = array.get(arr, j)
+                NVPOC p2 = array.get(arr, j + 1)
+                if p1.price > p2.price 
+                    array.set(arr, j, p2)
+                    array.set(arr, j + 1, p1)
+
+method sort_dn(array<NVPOC> arr) =>
+    int sz = array.size(arr)
+    if sz > 1
+        for i = 0 to sz - 2
+            for j = 0 to sz - 2 - i
+                NVPOC p1 = array.get(arr, j)
+                NVPOC p2 = array.get(arr, j + 1)
+                if p1.price < p2.price 
+                    array.set(arr, j, p2)
+                    array.set(arr, j + 1, p1)
+
+if not na(tbl_pos) and barstate.islast
+    array<NVPOC> up_alive = array.new<NVPOC>()
+    array<NVPOC> dn_alive = array.new<NVPOC>()
+    
+    if array.size(npocs) > 0
+        for i = 0 to array.size(npocs) - 1
+            NVPOC p = array.get(npocs, i)
+            if not p.hit
+                if p.price > close
+                    array.push(up_alive, p)
+                else if p.price < close
+                    array.push(dn_alive, p)
+                    
+    up_alive.sort_up()
+    dn_alive.sort_dn()
+    
+    int max_rows = 5
+    int up_count = math.min(array.size(up_alive), max_rows)
+    int dn_count = math.min(array.size(dn_alive), max_rows)
+    
+    int total_rows = 2 + (up_count == 0 ? 2 : up_count + 1) + (dn_count == 0 ? 2 : dn_count + 1)
+    
+    table hud = table.new(tbl_pos, 4, total_rows, bgcolor=bgHud, border_width=1, border_color=borderHud)
+    
+    // FILA 0: HEADER & FIRMA
+    table.cell(hud, 0, 0, "[ NVPOC MATRIX ]", text_color=txtMain, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    table.cell(hud, 1, 0, "", text_color=txtMain)
+    table.cell(hud, 2, 0, "", text_color=txtMain)
+    table.cell(hud, 3, 0, "CREATED BY H33RNAN", text_color=txtSub, text_size=size.small, text_halign=text.align_right, text_font_family=font.family_monospace)
+    
+    // FILA 1: SUB-HEADERS
+    table.cell(hud, 0, 1, "TARGET NPOC", text_color=txtSub, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(hud, 1, 1, "VOLUMEN", text_color=txtSub, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(hud, 2, 1, "PIPS", text_color=txtSub, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(hud, 3, 1, "DIST", text_color=txtSub, text_size=size.tiny, text_halign=text.align_right)
+    
+    int r = 2
+    
+    table.cell(hud, 0, r, "▲ UPSIDE", text_color=txtMain, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    r += 1
+    if up_count == 0
+        table.cell(hud, 0, r, "No Targets", text_color=txtSub, text_size=hudSize, text_halign=text.align_left)
+        r += 1
+    else
+        for i = 0 to up_count - 1
+            NVPOC p = array.get(up_alive, i)
+            float pips = (p.price - close) / syminfo.mintick / 10
+            string dist_str = "+" + str.tostring((p.price - close) / close * 100, "#.##") + "%"
+            color p_col = p.tier == 3 ? c_t3 : p.tier == 2 ? c_t2 : txtMain
+            
+            table.cell(hud, 0, r, str.tostring(p.price, format.mintick), text_color=txtMain, text_size=hudSize, text_halign=text.align_left, text_font_family=font.family_monospace)
+            table.cell(hud, 1, r, p.volume.format_vol(), text_color=p_col, text_size=hudSize, text_halign=text.align_center, text_font_family=font.family_monospace)
+            table.cell(hud, 2, r, str.tostring(pips, "#.#"), text_color=p_col, text_size=hudSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+            table.cell(hud, 3, r, dist_str, text_color=p_col, text_size=hudSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+            r += 1
+            
+    table.cell(hud, 0, r, "▼ DOWNSIDE", text_color=txtMain, text_size=size.small, text_halign=text.align_left, text_font_family=font.family_monospace)
+    r += 1
+    if dn_count == 0
+        table.cell(hud, 0, r, "No Targets", text_color=txtSub, text_size=hudSize, text_halign=text.align_left)
+        r += 1
+    else
+        for i = 0 to dn_count - 1
+            NVPOC p = array.get(dn_alive, i)
+            float pips = (close - p.price) / syminfo.mintick / 10
+            string dist_str = str.tostring((p.price - close) / close * 100, "#.##") + "%"
+            color p_col = p.tier == 3 ? c_t3 : p.tier == 2 ? c_t2 : txtMain
+            
+            table.cell(hud, 0, r, str.tostring(p.price, format.mintick), text_color=txtMain, text_size=hudSize, text_halign=text.align_left, text_font_family=font.family_monospace)
+            table.cell(hud, 1, r, p.volume.format_vol(), text_color=p_col, text_size=hudSize, text_halign=text.align_center, text_font_family=font.family_monospace)
+            table.cell(hud, 2, r, str.tostring(pips, "#.#"), text_color=p_col, text_size=hudSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+            table.cell(hud, 3, r, dist_str, text_color=p_col, text_size=hudSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+            r += 1
